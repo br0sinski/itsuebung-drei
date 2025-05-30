@@ -1,0 +1,92 @@
+Identifizieren Sie die eingebaute Sicherheitslücke (Hinweis: Es handelt sich um
+einen Hard-codierten Vergleich)
+
+Die Binary Datei öffnet zu begin ganz üblich eine print_banner() Methode und dann anschliessend zwei
+scanf() Aufrufe die jeweils eine Eingabe für einen Nutzernamen und ein Password abfragen.
+
+Diese Werte werden dann anschliessend in die Methode int authenticate(char* username, char* password) übergeben.
+
+Hier findet sich auch schon die ersten beiden Sicherheitslücke.
+
+Die Credentials sind hardcoded und werden mit strcmp verglichen.
+- 1. Problem: Die Hardcodeten Credentials -> können in einem Tool (wie bei mir Ghidra) im Plaintext ausgelesen werden - (Pointer: pw:  0804a00e - admin: 0804a008)
+- 2. Problem: strcmp() -> wenn beide Werte bei strcmp() == 0 sind wird EAX = 2 gesetzt - 0804923a
+- 2.5tes Problem: generell kein Hashing, keine Verschlüsselung (komme ich gleich zu) 
+
+Es gibt auch eine check_backdoor() Methode:
+
+Diese überprüft ob das Passwort "backdoor123" ist anhand strcmp - falls ja wird mit Adminrechten sich als JEDEN User angemeldet
+
+Nachdem das geschehen ist schauen wir mal weiter in die main() Methode rein:
+
+Hier finde ich nun den Rückgabewert von authenticate: 080494fc 89 45 f4        MOV        dword ptr [EBP + local_14],EAX
+
+
+Im Speicher wird nach dem Aufruf der authenticate() Methode geschaut welcher Wert vorhanden ist (GHIDRA: local_14 == 2 ? -> falls 0 terminiere weil login failed, falls es alles andere ist dann regular User )
+Login success (admin): dword ptr [EBP + local_14],0x2 ---> Ist der Wert 2? 
+Login success (regular user): gibt keinen direkten Vergleich, nur ob 2 oder 0, ich nehme einfach mal an obs 1 ist: impliziter Vergleich
+
+Login fail:                              login_checker.c:111 (6)
+        080494ff 83 7d f4 00     CMP        dword ptr [EBP + local_14],0x0 ---> Vergleich im Speicher ob der Lokale Wert nach Autenticate == 0 ist
+
+
+Mal angenommen die Credentials sind nicht hardcoded sondern irgendwie sicher gespeicht.
+
+Das Programm bleibt unsicher. strcmp() ist ein unsicherer Stringvergleich, man kann anhand einer Timing Attack herausfinden ab wann ein Zeichen failed. scanf() hat keine längenbegrenzung -> Buffer Overflow ist möglich
+
+Ich habe mal in der authenticate() Methode den strcmp() entfernt
+
+Vorher:
+
+                             login_checker.c:25 (20)
+        0804920a a1 30 c0        MOV        EAX,[admin_username]                             = 0804a008
+                 04 08
+        0804920f 83 ec 08        SUB        ESP,0x8
+        08049212 31 c0           XOR        EAX,EAX
+        08049214 75              ??         75h    u
+        08049215 08              ??         08h
+        08049216 e8 25 fe        CALL       <EXTERNAL>::strcmp                               int strcmp(char * __s1, char * _
+                 ff ff
+
+
+Nachher:
+
+                             login_checker.c:25 (20)
+        0804920a a1 30 c0        MOV        EAX,[admin_username]                             = 0804a008
+                 04 08
+        0804920f 83 ec 08        SUB        ESP,0x8
+        08049212 31 c0           XOR        EAX,EAX
+        08049214 83 c4 08        ADD        ESP,0x8
+        08049217 90              NOP
+        08049218 90              NOP
+        08049219 90              NOP
+        0804921a 90              NOP
+        0804921b 83 c4 10        ADD        ESP,0x10
+
+Wieso? Jetzt ist der Vergleich mit dem hardcodeten String weg, es gibt kein strcmp("admin", username) nicht mehr!
+Der Stack nimmt ursprünglich 9 Bytes an 
+
+Das wurde nun ersetzt durch:
+
+XOR	EAX, EAX (setzt EAX auf 0 -> das Result von strcmp ist damit 0/erfolgreich)
+ADD	ESP, 8	 (löscht die 8 bytes vom Stack)
+NOP	(macht grundsätzlich nichts, füllt aber die Speicherstelle damit das Programm noch läuft)
+
+Dasselbe kann ich auch für das Passwort machen, egal was eingegeben wird es wird 0 returned und jedes Passwort wird akzeptiert.
+
+Nagut dann patchen wir das ganze mal und machens toll und sicher!
+
+Ich könnte:
+
+- Debugger Tools erkennen und blockieren. 
+- Die Passwörter gehashed speichern und dann eine kleine Hashfunktion speichern und dann die Eingabe mit dem Hash vergleichen
+
+Machen wir uns mal an das erste dran:
+
+Ich habe eine einfache C-Methode geschrieben in ptrace_checker.c diese schaut anhand PTRACE_TRACEME ob der Login Checker durch ein Debug Tool läuft.
+Falls ja wird eine Nachricht ausgegeben und das Program terminiert.
+
+Anhand LIEF habe ich dies in die patched login_checker binary "injected"
+
+
+
